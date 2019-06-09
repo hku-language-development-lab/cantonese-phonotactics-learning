@@ -1,0 +1,68 @@
+---
+title: "RNN for phonotactics project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("G:\\§Úªº¶³ºÝµwºÐ\\Phonotactics\\judgement-experiment\\phonotactics-judgement-experiment")
+```
+
+## First preparations
+
+These are the libraries needed:
+
+```{r}
+library(tidyverse)
+library(tensorflow)
+library(rnn)
+library(stringr)
+```
+
+Let's import the corpus. We do not consider zeros as characters, but we do add a character 'B' to mark syllable boundaries, after Stoainov and Nerbonne. We turn the result first into a huge text string (tokenised_phonemes) (may be useful later), then as an R vector (tokenised_phonemes_vector) which we'll use later.
+
+```{r}
+corpus = read_csv("all_syls_withfile.csv")
+corpus = corpus %>% mutate(tokenised_phonemes = paste(o, n, c, t, "B")) %>% mutate(tokenised_phonemes =  gsub(" NA ", " ", tokenised_phonemes)) %>% mutate(tokenised_phonemes =  gsub("NA ", "", tokenised_phonemes))
+print(head(corpus))
+tokenised_phonemes = Reduce(paste, corpus$tokenised_phonemes)
+tokenised_phonemes_vector = strsplit(tokenised_phonemes, " ")[[1]]
+print(head(tokenised_phonemes_vector))
+print(head(tokenised_phonemes_vector))
+set.seed(2019) #for reproducibility
+```
+
+## Preparing the data
+First let's encode the phonemes as factors, check the levels are correct, then turn the factors into integers:
+
+```{r}
+tokenised_phonemes_vector = as.factor(tokenised_phonemes_vector)
+print(levels(tokenised_phonemes_vector))
+length(levels(tokenised_phonemes_vector)) # 35 - that's our dimensionality for one-hot encoding
+tokenised_phonemes_intvec = as.integer(tokenised_phonemes_vector)
+head(tokenised_phonemes_intvec)
+```
+
+Now we need to give the 'x' ('covariates', i.e. preceding context) and 'y'(')
+
+```{r}
+vocab_size = length(tokenised_phonemes_intvec)
+begin = list(pad_sequences(list(numeric()),maxlen=4,padding="pre"))
+x_list c(begin,lapply(1:(vocab_size-1), function(i) pad_sequences(list(tokenised_phonemes_intvec[1:i]),maxlen=4,padding="pre"))) #The first element is [0,0,0,0]; the second element is [0, 0, 0, first phoneme], and so on, until we get to the second last phoneme
+#Note: This step takes a loong time
+x = Reduce(rbind, x_list)
+x_onehot = lapply(1:vocab_size, function(i) as.integer(x == i))
+y = k_one_hot(tokenised_phonemes_intvec, num_classes = length(levels(tokenised_phonemes_vector)))
+```
+
+
+#Training the model
+A useful resource: https://stackoverflow.com/questions/51123481/how-to-build-a-language-model-using-lstm-that-assigns-probability-of-occurence-f/51126064#51126064
+
+```{r}
+model = keras_model_sequential() %>%
+layer_dense(units = 5, input_shape = c()) %>%
+layer_activation('relu') %>%
+layer_dense(units = vocab_size) %>%
+layer_activation('softmax')
+```
