@@ -22,13 +22,12 @@ library(stringr)
 Let's import the corpus. We do not consider zeros as characters, but we do add a character 'B' to mark syllable boundaries, after Stoainov and Nerbonne. We turn the result first into a huge text string (tokenised_phonemes) (may be useful later), then as an R vector (tokenised_phonemes_vector) which we'll use later.
 
 ```{r}
-corpus = read_csv("all_syls_withfile.csv")
+corpus = read_csv("all_parsed_syls_wt.csv")
 corpus = corpus %>% mutate(tokenised_phonemes = paste(o, n, c, t, "B")) %>% mutate(tokenised_phonemes =  gsub(" NA ", " ", tokenised_phonemes)) %>% mutate(tokenised_phonemes =  gsub("NA ", "", tokenised_phonemes))
 print(head(corpus))
-tokenised_phonemes = Reduce(paste, corpus$tokenised_phonemes)
-tokenised_phonemes_vector = strsplit(tokenised_phonemes, " ")[[1]]
-print(head(tokenised_phonemes_vector))
-print(head(tokenised_phonemes_vector))
+tokenised_phonemes = corpus$tokenised_phonemes
+tokenised_phonemes_vectors = lapply(tokenised_phonemes, function(syl) strsplit(syl, " ")[[1]])
+print(head(tokenised_phonemes_vectors))
 set.seed(2019) #for reproducibility
 ```
 
@@ -36,33 +35,62 @@ set.seed(2019) #for reproducibility
 First let's encode the phonemes as factors, check the levels are correct, then turn the factors into integers:
 
 ```{r}
-tokenised_phonemes_vector = as.factor(tokenised_phonemes_vector)
-print(levels(tokenised_phonemes_vector))
-length(levels(tokenised_phonemes_vector)) # 35 - that's our dimensionality for one-hot encoding
-tokenised_phonemes_intvec = as.integer(tokenised_phonemes_vector)
-head(tokenised_phonemes_intvec)
+vocab = sort(unique(c(unique(corpus$o),unique(corpus$n),unique(corpus$c),unique(corpus$t),"B")))
+vocab_size = length(vocab)
+tokenised_phonemes_vectors = lapply(tokenised_phonemes_vectors, function(x) factor(x, levels = vocab))
+tokenised_phonemes_intvecs = lapply(tokenised_phonemes_vectors, function(x) as.integer(x))
+head(tokenised_phonemes_intvecs)
 ```
+
 
 Now we need to give the 'x' ('covariates', i.e. preceding context) and 'y'(')
 
 ```{r}
-vocab_size = length(tokenised_phonemes_intvec)
-begin = list(pad_sequences(list(numeric()),maxlen=4,padding="pre"))
-x_list c(begin,lapply(1:(vocab_size-1), function(i) pad_sequences(list(tokenised_phonemes_intvec[1:i]),maxlen=4,padding="pre"))) #The first element is [0,0,0,0]; the second element is [0, 0, 0, first phoneme], and so on, until we get to the second last phoneme
+begin = pad_sequences(list(numeric()),maxlen=4,padding="pre")
+get_x_values = function(syl){
+  rbind(begin,t(sapply(1:length(syl)-1,function(i) pad_sequences(list(syl[1:i]),maxlen=4,padding="pre"))))
+}
+x_list = lapply(tokenised_phonemes_intvecs, function(syl) get_x_values(syl))  #The first element is [0,0,0,0]; the second element is [0, 0, 0, first phoneme], and so on, until we get to the second last phoneme
 #Note: This step takes a loong time
-x = Reduce(rbind, x_list)
+x = Reduce(rbind, x_list, begin)
+n = nrow(x)
 x_onehot = lapply(1:vocab_size, function(i) as.integer(x == i))
-y = k_one_hot(tokenised_phonemes_intvec, num_classes = length(levels(tokenised_phonemes_vector)))
+tokenised_phonemes_intvecs_concatenated = Reduce(c, tokenised_phonemes_intvecs)
+y_onehot = sapply(1:vocab_size, function(i) as.integer(y == i))
 ```
 
 
 #Training the model
 A useful resource: https://stackoverflow.com/questions/51123481/how-to-build-a-language-model-using-lstm-that-assigns-probability-of-occurence-f/51126064#51126064
 
+The first layer (embedding) turns the integers into dense vectors. The second layer is the RNN layer. The third layer is the softmax that gives the output probs.
+
 ```{r}
-model = keras_model_sequential() %>%
-layer_dense(units = 5, input_shape = c()) %>%
-layer_activation('relu') %>%
-layer_dense(units = vocab_size) %>%
-layer_activation('softmax')
+model_5d = keras_model_sequential() %>%
+layer_embedding(vocab_size + 1, 15, input_length = 4) %>%
+layer_activation("relu") %>%
+layer_simple_rnn(units = vocab_size) %>%
+layer_activation("relu") %>%
+layer_dense(vocab_size) %>%
+layer_activation("softmax") %>%
+compile("rmsprop", "categorical_crossentropy")
+print(model_5d)
+```
+
+
+
+```{r}
+shuffled_indices = rank(runif(nrow(x)))
+x_shuffled = x[shuffled_indices,]
+y_shuffled = y[shuffled_indices]
+n_train = round(nrow(x) * .9)
+x_train = x_shuffled[1:n_train,]
+y_train = y_onehot[1:n_train,]
+x_test = x_shuffled[(n_train+1):nrow(x),]
+y_test = y_onehot[(n_train+1):nrow(x),]
+
+model_5d_history = model_5d %>% fit(x_train, y_train, epochs = 10, batch_size = 100, steps_per_epoch = 100, val_data = list(x_test, y_test), metrics = c("accuracy"))
+plot(model_5d_history)
+predictions = predict(model_5d, x_test)
+colnames(predictions) = vocab
 ```
