@@ -1,0 +1,297 @@
+---
+
+title: "Production of Vitevich and Luce-type quantities"
+output: html_document
+---
+
+```{r, include = FALSE}
+setwd("G:\\§Úªº¶³ºÝµwºÐ\\Phonotactics\\judgement-experiment\\phonotactics-judgement-experiment")
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(nnet)
+library(crayon)
+```
+
+First let's store all the possible initials, nuclei and finals.
+
+```{r}
+initials = c("0","b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "N", "h", "G", "K", "w", "z", "c", "s", "j")
+nuclei = c("A", "a", "e", "i", "o", "u", "O", "Y", "0", "E")
+finals = c("0", "i", "u", "m", "n", "N", "p", "t", "k","Y")
+phonemeInventory = union(initials,union(nuclei,finals))
+phonemeInventoryno0 = setdiff(union(initials,union(nuclei,finals)),"0")
+tones = c("1", "2", "3", "4", "5", "6")
+```
+
+Now let's get down to business. First, we read the data stored in the file `all_parsed_syls_wt.csv`, which I created long ago from the Hong Kong Cantonese Corpus (HKCanCor). We then make two versions of the original data.frame, one grouped by segments + tone, the other one grouped by segments alone, i.e. syllables with same segments but different tone are collapsed.
+
+```{r}
+monosyls.data = read.csv("all_parsed_syls_wt.csv",stringsAsFactors=FALSE)
+monosyls.data = monosyls.data %>% mutate(c = case_when(n %in% c("E", "o","u") & c == "i" ~ "Y", T ~ c)) #We want final /i/s to become /Y/s, because we don't want 'bias' in favour of the unrounded version - detailed argument in the final paper
+head(monosyls.data)
+monosyls.summary.wt = monosyls.data %>% group_by(o, n, c, t) %>% count(name="no")
+head(monosyls.summary.wt)
+monosyls.summary =  monosyls.data %>% group_by(o, n, c) %>% count(name="no")
+head(monosyls.summary)
+```
+
+
+Let's start with the easiest - the raw probability of each tone.
+
+```{r}
+tone.overall.summary = monosyls.data %>% group_by(t) %>% summarise(n())
+tone.overall.probs = tone.overall.summary[,2] / sum(tone.overall.summary[,2])
+print(tone.overall.probs)
+write.table(tone.overall.probs,file="ToneOverallProbs.txt",sep="\t")
+```
+
+How about the probability of the tone given the segments? Let's do this by simple tallying first.
+
+```{r}
+tone.given.segs = monosyls.summary[1:3] %>% mutate(t1=0,t2=0,t3=0,t4=0,t5=0,t6=0) #the 'framework' in which we will put the values
+
+for(i in 1:nrow(tone.given.segs)){
+  total = as.numeric(monosyls.summary[i,4]);
+  for(j in 1:6){
+    
+    count = as.numeric(monosyls.summary.wt[monosyls.summary.wt[,1]==as.character(monosyls.summary[i,1])&
+                                             monosyls.summary.wt[,2]==as.character(monosyls.summary[i,2])&
+                                             monosyls.summary.wt[,3]==as.character(monosyls.summary[i,3])&
+                                             monosyls.summary.wt[,4]==j,5]);
+    if(!(is.na(count)) & total != 0){
+      tone.given.segs[i,j+3] = count / total
+    }
+  }
+}
+head(tone.given.segs)
+
+write.table(tone.given.segs,file="ToneCondOnSegs.txt",sep="\t")
+```
+
+A disadvantage of the above method is that we have no way of predicting P(tone|segments) for non-existing syllable strings. This is a problem, so let's instead construct a multinomial logistic model. Note that I only include main effects; we don't have enough degrees of freedom to add all interaction effects, thanks to non-existing syllables.
+
+```{r}
+tone.given.seg.lm = multinom(t ~ o + n + c, data = monosyls.data) #construct the model
+
+#Grab the parameter value estimates
+tone.given.seg.coef = coef(tone.given.seg.lm)
+tone.given.seg.coef.intercept = tone.given.seg.coef[,1]
+tone.given.seg.coef.onset = tone.given.seg.coef[,substring(colnames(tone.given.seg.coef),1,1) == "o"]
+tone.given.seg.coef.nucleus = tone.given.seg.coef[,substring(colnames(tone.given.seg.coef),1,1) == "n"]
+tone.given.seg.coef.coda = tone.given.seg.coef[,substring(colnames(tone.given.seg.coef),1,1) == "c"]
+colnames(tone.given.seg.coef.onset) = substring(colnames(tone.given.seg.coef.onset),2,2)
+colnames(tone.given.seg.coef.nucleus) = substring(colnames(tone.given.seg.coef.nucleus),2,2)
+colnames(tone.given.seg.coef.coda) = substring(colnames(tone.given.seg.coef.coda),2,2)
+
+#Define a function to get estimates from the model
+getToneProbs = function(word){
+  #Extract the syllable components
+  o = substring(word,1,1)
+  n = substring(word,2,2) 
+  c = substring(word,3,3)
+  
+  #Get the eta of each tone
+  etas = c(as.vector(tone.given.seg.coef.intercept))
+  if(o != "0") etas = etas + tone.given.seg.coef.onset[,o]
+  if(n != "a") etas = etas + tone.given.seg.coef.nucleus[,n]
+  if(c != "0") etas = etas + tone.given.seg.coef.coda[,c]
+  
+  #Get the probabilities from the etas, and return the probs
+  odds = c(1,exp(etas))
+  names(odds) = as.character(1:6)
+  probs = odds / sum(odds)
+  return(probs)
+}
+
+#Again, get a table and fill in the probs
+tone.given.segs.softmax = mutate(tone.given.segs,t1=0,t2=0,t3=0,t4=0,t5=0,t6=0)
+for(i in 1:nrow(tone.given.segs.softmax)){
+  components = as.matrix(tone.given.segs.softmax[i,c("o","n","c")])
+  word = paste0(components[1],components[2],components[3])
+  tone.given.segs.softmax[i,paste0("t",1:6)] = getToneProbs(word)
+}
+
+write.table(tone.given.segs,file="ToneCondOnSegsSoftmax.txt",sep="\t")
+
+```
+
+
+That's enough of tones for now. Moving on to positional probabilities, we first have the positional probabilities. Unlike Vitevich and Luce, we will consider the three positions to be the onset, nucleus and coda, as this is better supported for Chinese.
+
+```{r}
+#Tally up the syllable components
+freqs_ons = monosyls.data %>% group_by(o) %>% count(name="no")
+freqs_nuc = monosyls.data %>% group_by(n) %>% count(name="no")
+freqs_coda = monosyls.data %>% group_by(c) %>% count(name="no")
+
+probs_ons = freqs_ons %>% mutate(onsProb = no / nrow(monosyls.data))
+probs_nuc = freqs_nuc %>% mutate(nucProb = no / nrow(monosyls.data))
+probs_coda = freqs_coda %>% mutate(codaProb = no / nrow(monosyls.data))
+posProbs = full_join(probs_ons, probs_nuc, by = c("o" = "n"))
+posProbs = full_join(posProbs, probs_coda, by = c("o" = "c"))
+posProbs = replace(posProbs,is.na(posProbs),0)
+colnames(posProbs) = c("phoneme","freqOnset","probOnset","freqNuc","probNuc","freqCoda","probCoda")
+head(posProbs)
+write.csv(posProbs,"pos_probs_syl_components.csv")
+```
+
+
+
+We repeat the above using types instead of tokens.
+
+```{r}
+freqs_ons_type = monosyls.summary.wt %>% group_by(o) %>% count(name="no")
+freqs_nuc_type = monosyls.summary.wt %>% group_by(n) %>% count(name="no")
+freqs_coda_type = monosyls.summary.wt %>% group_by(c) %>% count(name="no")
+
+probs_ons = freqs_ons_type %>% mutate(onsProb = no / nrow(monosyls.summary.wt))
+probs_nuc = freqs_nuc_type %>% mutate(nucProb = no / nrow(monosyls.summary.wt))
+probs_coda = freqs_coda_type %>% mutate(codaProb = no / nrow(monosyls.summary.wt))
+posProbs_type = full_join(probs_ons, probs_nuc, by = c("o" = "n"))
+posProbs_type = full_join(posProbs_type, probs_coda, by = c("o" = "c"))
+posProbs_type = replace(posProbs,is.na(posProbs),0)
+colnames(posProbs_type) = c("phoneme","freqOnset","probOnset","freqNuc","probNuc","freqCoda","probCoda")
+write.csv(posProbs_type,"pos_probs_syl_components_type.csv")
+
+```
+
+
+We try a version using Vitevich and Luce's original idea.
+
+```{r}
+
+#Positional probs (phoneme instead of syl components)
+monosyls.data = monosyls.data %>% mutate(fullstring = paste(o,n,c,sep=""))
+monosyls.data$fullstring = gsub("0","",monosyls.data$fullstring) #We must remove the 0s from the corpus first; otherwise we'll be pretty much doing what we did above.
+monosyls.data = monosyls.data %>% mutate(length = nchar(fullstring)) #Calculating the length (in terms of segment) of each syl.
+head(monosyls.data)
+
+calculatePosProb = function(k){ #k = index of the position
+  curr_syls = monosyls.data %>% dplyr::filter(length >= k) #We exclude words without this position
+  phonemes = substring(curr_syls$fullstring,k,k)
+  distribution = summary(factor(phonemes, levels = phonemeInventory))
+  distribution = distribution / sum(distribution)
+  
+  return(distribution)
+}
+
+posProbsPhoneme = sapply(1:max(monosyls.data$length),calculatePosProb)
+colnames(posProbsPhoneme) = paste("Pos",1:max(monosyls.data$length),sep="")
+write.csv(posProbsPhoneme,"pos_probs_phoneme.csv")
+```
+
+And again, attempt a version with types rather than tokens.
+
+```{r}
+monosyls.summary.wt = monosyls.summary.wt %>% mutate(fullstring = paste(o,n,c,sep=""))
+monosyls.summary.wt$fullstring = gsub("0","",monosyls.summary.wt$fullstring)
+monosyls.summary.wt = monosyls.summary.wt %>% mutate(length = nchar(fullstring))
+head(monosyls.summary.wt)
+
+calculatePosProb_type = function(k){
+  curr_syls = monosyls.summary.wt %>% dplyr::filter(length >= k)
+  phonemes = substring(curr_syls$fullstring,k,k)
+  distribution = summary(factor(phonemes, levels = phonemeInventory))
+  distribution = distribution / sum(distribution)
+  
+  return(distribution)
+}
+posProbsPhoneme_type = sapply(1:max(monosyls.summary.wt$length),calculatePosProb_type)
+colnames(posProbsPhoneme_type) = paste("Pos",1:max(monosyls.data$length),sep="")
+head(posProbsPhoneme_type)
+write.csv(posProbsPhoneme_type,"pos_probs_phoneme_type.csv")
+
+```
+
+
+
+Now we do traditional transitional probabilities:
+
+```{r}
+#Define a bigram that finds all bigrams for each ending index k
+findBigrams = function(k){
+  curr_syls = monosyls.data %>% dplyr::filter(length >= k)
+  bigrams = substring(curr_syls$fullstring,k-1,k)
+  return(bigrams)
+}
+bigrams = unlist(sapply(2:max(monosyls.data$length),findBigrams))
+print(unique(bigrams))
+
+#Put the bigrams in a DF summarised by counts
+bigramsDF = data.frame(first = substring(bigrams,1,1), second = substring(bigrams,2,2)) %>% group_by(first, second) %>% count()
+transMatrix = matrix(0,nrow=length(phonemeInventoryno0),ncol=length(phonemeInventoryno0))
+colnames(transMatrix) = phonemeInventoryno0
+rownames(transMatrix) = phonemeInventoryno0
+for(g in phonemeInventoryno0){
+  currBigrams = bigramsDF %>% dplyr::filter(first == g)
+  total = sum(currBigrams$n)
+  for(r in phonemeInventoryno0){
+    if(r %in% currBigrams$second){
+      transMatrix[g,r] = as.numeric((1+currBigrams[currBigrams$second == r,"n"])/(total + ncol(transMatrix)))
+    } else{
+      transMatrix[g,r] = 1/(total + ncol(transMatrix))
+    }
+  }
+}
+head(transMatrix)
+write.csv(transMatrix,"trans_probs_phoneme.csv")
+```
+
+And a version with syllable components:
+
+```{r}
+#Transitional probs (syl components)
+monosyls.data = monosyls.data %>% mutate(fullstringw0 = paste(o,n,c,sep=""))
+findBigramsFixedLength = function(k){
+  bigrams = substring(monosyls.data$fullstringw0,k-1,k)
+  return(bigrams)
+}
+bigrams = c(findBigramsFixedLength(2),findBigramsFixedLength(3))
+
+bigramsDF = data.frame(first = substring(bigrams,1,1), second = substring(bigrams,2,2))
+bigramsDF = bigramsDF %>% group_by(first, second) %>% count()
+
+transMatrixw0 = matrix(0,nrow=length(phonemeInventory),ncol=length(phonemeInventory))
+colnames(transMatrixw0) = phonemeInventory
+rownames(transMatrixw0) = phonemeInventory
+for(g in phonemeInventory){
+  currBigrams = bigramsDF %>% dplyr::filter(first == g)
+  total = sum(currBigrams$n)
+  for(r in phonemeInventory){
+    if(r %in% currBigrams$second){
+      transMatrixw0[g,r] = as.numeric((1+currBigrams[currBigrams$second == r,"n"])/(total + ncol(transMatrixw0)))
+    } else{
+      transMatrixw0[g,r] = 1/(total + ncol(transMatrixw0))
+    }
+  }
+}
+write.csv(transMatrixw0,"trans_probs_sylcomp.csv")
+```
+
+Our final foray is into biphone probs, first in the traditional method:
+
+```{r}
+
+#Biphone positional probs
+calculatePosProb = function(k){
+  curr_syls = monosyls.data %>% dplyr::filter(length >= k)
+  phonemes = substring(curr_syls$fullstring,k,k)
+  distribution = summary(as.factor(phonemes))
+  distribution = distribution / sum(distribution)
+  
+  return(distribution)
+}
+distributions = sapply(1:max(monosyls.data$length),calculatePosProb)
+for(i in distributions){
+  phonemeInventoryw0 = unique(c(phonemeInventoryw0,names(i)))
+}
+posProbsPhoneme = sapply(distributions,function(x) return(replace(x[phonemeInventoryw0],is.na(x[phonemeInventoryw0]),0)))
+rownames(posProbsPhoneme) = phonemeInventoryw0
+colnames(posProbsPhoneme) = paste("Pos",1:max(monosyls.data$length),sep="")
+
+write.csv(biphoneMatrix,"probs_trans_phoneme.csv")
+```

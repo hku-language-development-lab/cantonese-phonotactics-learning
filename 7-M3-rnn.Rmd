@@ -1,0 +1,126 @@
+---
+title: "RNN for phonotactics project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("G:\\§Úªº¶³ºÝµwºÐ\\Phonotactics\\judgement-experiment\\phonotactics-judgement-experiment")
+```
+
+## First preparations
+
+These are the libraries needed:
+
+```{r}
+library(tidyverse)
+library(tensorflow)
+library(rnn)
+library(stringr)
+```
+
+Let's import the corpus. We do not consider zeros as characters, but we do add a character 'B' to mark syllable boundaries, after Stoainov and Nerbonne. We turn the result first into a huge text string (tokenised_phonemes) (may be useful later), then as an R vector (tokenised_phonemes_vector) which we'll use later.
+
+```{r}
+corpus = read_csv("all_parsed_syls_wt.csv")
+corpus = corpus %>% mutate(tokenised_phonemes = paste(o, n, c, t, "B")) %>% mutate(tokenised_phonemes =  gsub(" NA ", " ", tokenised_phonemes)) %>% mutate(tokenised_phonemes =  gsub("NA ", "", tokenised_phonemes))
+print(head(corpus))
+tokenised_phonemes = corpus$tokenised_phonemes
+tokenised_phonemes_vectors = lapply(tokenised_phonemes, function(syl) strsplit(syl, " ")[[1]])
+print(head(tokenised_phonemes_vectors))
+set.seed(2019) #for reproducibility
+```
+
+## Preparing the data
+First let's encode the phonemes as factors, check the levels are correct, then turn the factors into integers:
+
+```{r}
+vocab = sort(unique(c(unique(corpus$o),unique(corpus$n),unique(corpus$c),unique(corpus$t),"B")))
+vocab_size = length(vocab)
+tokenised_phonemes_vectors = lapply(tokenised_phonemes_vectors, function(x) factor(x, levels = vocab))
+tokenised_phonemes_intvecs = lapply(tokenised_phonemes_vectors, function(x) as.integer(x))
+head(tokenised_phonemes_intvecs)
+```
+
+Let's split the corpus into train and test sets. I'm shuffling the word in the corpus first so that there's no pattern as to what gets in the training set and what gets in the test set. Then I split the last 1/10 of the shuffled data into the test set.
+
+```{r}
+corpsize = length(tokenised_phonemes_intvecs) #155672
+shuffled_indices = rank(runif(corpsize)) 
+tokenised_phonemes_intvecs_shuffled = tokenised_phonemes_intvecs[shuffled_indices]
+n_train = round(corpsize*.9)
+intvecs_train = tokenised_phonemes_intvecs_shuffled[1:n_train]
+intvecs_test = tokenised_phonemes_intvecs_shuffled[(n_train+1):corpsize]
+```
+
+Now we need to give the 'x' ('covariates', i.e. preceding context) and 'y' (i.e. phoneme immediately after that context)
+
+```{r}
+begin = pad_sequences(list(numeric()),maxlen=4,padding="pre")
+get_x_values = function(syl){
+  rbind(begin,t(sapply(1:(length(syl)-1),function(i) pad_sequences(list(syl[1:i]),maxlen=4,padding="pre"))))#The first element is [0,0,0,0]; the second element is [0, 0, 0, first phoneme], and so on, until we get to the second last phoneme
+}
+x_train_list = lapply(intvecs_train, function(syl) get_x_values(syl)) #Note: This step takes a loong time
+x_test_list = lapply(intvecs_test, function(syl) get_x_values(syl))
+#x_train_list = lapply(x_train_list, function(syl) syl[-nrow(syl),])
+#x_test_list = lapply(x_train_list, function(syl) syl[-nrow(syl),])
+x_train = Reduce(rbind, x_train_list)
+x_test = Reduce(rbind, x_test_list)
+x_train_onehot = lapply(1:vocab_size, function(i) as.integer(x_train == i))
+x_test_onehot = lapply(1:vocab_size, function(i) as.integer(x_test == i))
+x_train_array = array(Reduce(c,x_train_onehot), dim = c(nrow(x_train),4,length(x_train_onehot)))
+x_test_array = array(Reduce(c,x_test_onehot), dim = c(nrow(x_test),4,length(x_test_onehot)))
+y_train = intvecs_train
+tokenised_phonemes_intvecs_concatenated = Reduce(c, tokenised_phonemes_intvecs)
+y_train_int = Reduce(c, intvecs_train[1:length(intvecs_train)])
+y_test_int = Reduce(c, intvecs_test[1:length(intvecs_train)])
+y_train = sapply(1:vocab_size, function(i) as.integer(y_train_int == i))
+y_test = sapply(1:vocab_size, function(i) as.integer(y_test_int == i))
+```
+
+
+
+#Training the model
+A useful resource: https://stackoverflow.com/questions/51123481/how-to-build-a-language-model-using-lstm-that-assigns-probability-of-occurence-f/51126064#51126064
+
+As one can see here, the model first has an RNN layer. In the model specification, the neurons take an $4 \times V$ array as its input. At each stage, a V-dimensional vector representing the previous segment is presented to the hidden layer, along with the activation from the previous state. There is also a bias term. There are 36 hidden units in this layer, leading to a total of $(36 + 36 + 1) \times 36 = 2628$ weight parameters.
+
+The second layer is just the softmax output layer. There are 36 units corresponding to the 36 'letters', and we use softmax, which is standard for categorical responses.
+
+```{r}
+model = keras_model_sequential() %>%
+layer_simple_rnn(units = vocab_size, input_shape = c(4, vocab_size)) %>%
+layer_dense(vocab_size) %>%
+layer_activation("softmax") %>%
+compile("rmsprop", "categorical_crossentropy", metrics = c("accuracy"))
+print(model)
+```
+
+
+We now fit the model. We use 10 epochs, with 100 steps per epoch and batch size of 100. We could do more with our amount of data, but this is required to ensure a reasonable training time. 
+
+```{r}
+model_history = model %>% fit(x_train_array, y_train, epochs = 10, batch_size = 100, steps_per_epoch = 100, val_data = list(x_test_array, y_test), metrics = c("accuracy"))
+plot(model_history)
+predictions = predict(model, x_test_array)
+colnames(predictions) = vocab
+```
+
+We may now create a function to output the language model probability of any syllable. The basic idea is just to turn the syllable into the format readable by the RNN model, then obtain the probabilities of the 'correct' output each time. The log-probability of the entire string is the sum of the log-conditional probabilities.
+
+```{r}
+find_rnn_prob = function(syl_char, rnn_model){
+  syl = as.integer(factor(strsplit(paste0(syl_char,"B"),"")[[1]], levels = vocab))
+  x_syl = get_x_values(syl)
+  x_syl_onehot = lapply(1:vocab_size, function(i) as.integer(x_syl == i))
+  x_syl_array = array(Reduce(c,x_syl_onehot), dim = c(nrow(x_syl),4,length(x_syl_onehot)))
+  preds_syl = predict(rnn_model, x_syl)
+  sum(log(diag(preds_syl[,syl])))
+}
+
+predictions = predict(model, x_test_array)
+
+
+save.image("with_rnn.Rdata")
+
+```
