@@ -1,0 +1,218 @@
+---
+
+title: "Production of Vitevich and Luce-type quantities"
+output: html_document
+---
+
+First I extract from the best monosyllable model from the previous study:
+
+```{r}
+library(mclust)
+library(brms)
+library(dplyr)
+library(readr)
+library(MASS)
+
+setwd("G:\\§Úªº¶³ºÝµwºÐ\\Phonotactics\\judgement-experiment\\phonotactics-judgement-experiment")
+load("data_with_mono_model.RData")
+
+#Extract posterior of the previous study
+mono_dist_model_prevstudy = model_mono_hamming_co_hamming_seg_new
+mono_draws = extract(mono_dist_model_prevstudy$fit)
+mono_draws_b_df = cbind.data.frame(mono_draws$b_Intercept, mono_draws$b)
+mono_draws_sd_part_df = mono_draws$sd_1
+mono_draws_cor_part_df = mono_draws$cor_1
+mono_draws_sigma_df = mono_draws$sigma
+mono_draws_sd_var_df = mono_draws$sd_2
+#Not strictly necessary, but I prefer to give them meaningful names
+colnames(mono_draws_b_df) = c("b_Intercept","b_hamming_segdists_new","b_hamming_co")
+colnames(mono_draws_sd_part_df) = c("sd_participant__Intercept", "sd_participant__hamming_segdists_new", "sd_participant__hamming_co")
+colnames(mono_draws_cor_part_df) = c("cor_participant__Intercept__hamming_segdists_new","cor_participant__Intercept__hamming_co","cor_participant__hamming_segdists_new__hamming_co")
+colnames(mono_draws_sd_var_df) = c("sd_variable__Intercept")
+```
+
+In order for the posteriors to work as priors in Stan, they need to be given a functional form, so I use GMM modelling here:
+
+```{r}
+
+#Fit GMMs to the posteriors
+mono_draws_b_gmm = densityMclust(mono_draws_b_df)
+mono_draws_sd_part_gmm = densityMclust(mono_draws_sd_part_df)
+mono_draws_sd_var_gmm = densityMclust(mono_draws_sd_var_df)
+mono_draws_sigma_gmm = densityMclust(mono_draws_sigma_df)
+
+getCorrelCholesky = function(correlations){
+  ladd = matrix(c(.5,0,0,correlations[1],.5,0,correlations[2],correlations[3],.5),nrow=3,byrow=T)
+  correlMatrix = ladd + t(ladd)
+  lowerMatrix = t(chol(correlMatrix))
+  return(c(lowerMatrix[2,1],lowerMatrix[3,1],lowerMatrix[3,2]))
+}
+mono_draws_cor_part_cholesky_df = t(sapply(1:nrow(mono_draws_cor_part_df),function(x) return(getCorrelCholesky(mono_draws_cor_part_df[x,]))))
+mono_draws_cor_part_cholesky_gmm = densityMclust(mono_draws_cor_part_cholesky_df)
+
+#Data for testing models - just extracts of the old data for now...
+dist_judgements_melted_mono_new = dist_judgements_melted_mono %>% filter(as.integer(participant) %in% c(1,2))
+
+```
+
+The following code successively adds priors for the various parameters into the main Stan model. The model is the same one as our previous study.
+
+```{r}
+#Model time!
+#First add priors
+#Note that the code here depends on the actual structure from the Mclusts. It's not general.
+#I should make it a project for myself to write a package to turn MClust results into Stan priors someday.
+#mono_dist_model_currstudy_sim_stanvars = stanvar(x = mono_draws_sigma_gmm$parameters$mean, name = "sigma_prior_mean", block = "data") + stanvar(x = mono_draws_sigma_gmm$parameters$variance$sigmasq, name = "sigma_prior_var", block = "data")
+mono_dist_model_currstudy_sim_priors = get_prior(distance | cens(censored) ~ (hamming_segdists_new + hamming_co | participant) +(1|variable) + hamming_segdists_new + hamming_co, data = dist_judgements_melted_mono_new)
+#mono_dist_model_currstudy_sim_priors$prior[14] = "normal(sigma_prior_mean, sigma_prior_var)"
+
+
+
+#Prior for sd_variable__Intercept:
+mono_dist_model_currstudy_sim_stanvars = stanvar(x = mono_draws_sd_var_gmm$parameters$pro, name = "sd_var_prior_mixprobs", block = "data") + stanvar(x = mono_draws_sd_var_gmm$parameters$mean, name = "sd_var_prior_means", block = "data") + stanvar(x = rep(mono_draws_sd_var_gmm$parameters$variance$sigmasq,2), name = "sd_var_prior_vars", block = "data")
+mono_dist_model_currstudy_sim_priors = mono_dist_model_currstudy_sim_priors + set_prior("{ \n  real sd_var_prior_contrib[2];\n  for (k in 1:2){\n    sd_var_prior_contrib[k] = log(sd_var_prior_mixprobs[k])+normal_lpdf(sd_2 | sd_var_prior_means[k], sqrt(sd_var_prior_vars[k])); \n  } \n  target += log_sum_exp(sd_var_prior_contrib);  \n}", check = FALSE)
+
+
+
+#Removed: b_prior_vars_cholesky[2] = b_prior_vars_cholesky_2;
+#+ stanvar(x = mono_draws_b_gmm_cov_cholesky_2, name = "b_prior_vars_cholesky_2", block = "data")
+# + stanvar(x = mono_draws_b_gmm$parameters$pro, name = "b_prior_mixprobs", block = "data")
+#log(b_prior_mixprobs[k])+
+#Prior for fixed effects:
+mono_draws_b_gmm_cov_cholesky_1 = t(chol(mono_draws_b_gmm$parameters$variance$sigma[,,1]))
+#mono_draws_b_gmm_cov_cholesky_2 = t(chol(mono_draws_b_gmm$parameters$variance$sigma[,,2]))
+mono_dist_model_currstudy_sim_stanvars = mono_dist_model_currstudy_sim_stanvars  + stanvar(x = mono_draws_b_gmm$parameters$mean, name = "b_prior_means", block = "data") + stanvar(x = mono_draws_b_gmm_cov_cholesky_1, name = "b_prior_vars_cholesky_1", block = "data")  + stanvar(scode="
+  matrix[3, 3] b_prior_vars_cholesky[1];
+  matrix[3, 3] cor_part_cholesky_prior_vars_cholesky[3];
+  b_prior_vars_cholesky[1] = b_prior_vars_cholesky_1;", block = "tparameters")
+mono_dist_model_currstudy_sim_priors = mono_dist_model_currstudy_sim_priors + set_prior("  {
+    real b_prior_contrib[1];
+    vector[3] b_with_Intercept;
+    b_with_Intercept[1] = temp_Intercept - dot_product(means_X, b);
+    b_with_Intercept[2] = b[1];
+    b_with_Intercept[3] = b[2];
+    for (k in 1:1){
+      b_prior_contrib[k] = multi_normal_cholesky_lpdf(b_with_Intercept | b_prior_means[,k], b_prior_vars_cholesky[k]);
+    }
+    target += log_sum_exp(b_prior_contrib);
+  }
+", check = FALSE)
+mono_dist_model_currstudy_sim_priors$prior[6] = "" #Suppress the original intercept prior
+
+#Prior for participant-level SDs
+mono_draws_sd_part_gmm_vars = sapply(1:3, function(x) return(diag(mono_draws_sd_part_gmm$parameters$variance$sigma[,,x])))
+mono_dist_model_currstudy_sim_stanvars = mono_dist_model_currstudy_sim_stanvars + stanvar(x = mono_draws_sd_part_gmm$parameters$pro, name = "sd_part_prior_mixprobs", block = "data") + stanvar(x = mono_draws_sd_part_gmm$parameters$mean, name = "sd_part_prior_means", block = "data") + stanvar(x = mono_draws_sd_part_gmm_vars, name = "sd_part_prior_vars", block = "data")
+mono_dist_model_currstudy_sim_priors = mono_dist_model_currstudy_sim_priors + set_prior("  {
+    real sd_part_prior_contrib[3];
+    for (k in 1:3){
+      sd_part_prior_contrib[k] = log(sd_part_prior_mixprobs[k]);
+      for (i in 1:3){
+        sd_part_prior_contrib[k] += normal_lpdf(sd_1[i] | sd_part_prior_means[i,k], sqrt(sd_part_prior_vars[i,k]));
+      }
+    }
+    target += log_sum_exp(sd_part_prior_contrib);
+  }
+", check = FALSE)
+mono_dist_model_currstudy_sim_priors$prior[7] = "" #Suppress the original intercept prior
+
+#Final boss: Prior for participant-level correlations
+mono_draws_cor_part_cholesky_gmm_cov_cholesky_1 = t(chol(mono_draws_cor_part_cholesky_gmm$parameters$variance$sigma[,,1]))
+mono_draws_cor_part_cholesky_gmm_cov_cholesky_2 = t(chol(mono_draws_cor_part_cholesky_gmm$parameters$variance$sigma[,,2]))
+mono_draws_cor_part_cholesky_gmm_cov_cholesky_3 = t(chol(mono_draws_cor_part_cholesky_gmm$parameters$variance$sigma[,,3]))
+
+mono_dist_model_currstudy_sim_stanvars = mono_dist_model_currstudy_sim_stanvars + stanvar(x = mono_draws_cor_part_cholesky_gmm$parameters$pro, name = "cor_part_cholesky_prior_mixprobs", block = "data") + stanvar(x = mono_draws_cor_part_cholesky_gmm$parameters$mean, name = "cor_part_cholesky_prior_means", block = "data") + stanvar(x = mono_draws_cor_part_cholesky_gmm_cov_cholesky_1, name = "cor_part_cholesky_prior_vars_cholesky_1", block = "data")+ stanvar(x = mono_draws_cor_part_cholesky_gmm_cov_cholesky_2, name = "cor_part_cholesky_prior_vars_cholesky_2", block = "data")+ stanvar(x = mono_draws_cor_part_cholesky_gmm_cov_cholesky_3, name = "cor_part_cholesky_prior_vars_cholesky_3", block = "data") + stanvar(scode="
+   cor_part_cholesky_prior_vars_cholesky[1] = cor_part_cholesky_prior_vars_cholesky_1;
+   cor_part_cholesky_prior_vars_cholesky[2] = cor_part_cholesky_prior_vars_cholesky_2;
+   cor_part_cholesky_prior_vars_cholesky[3] = cor_part_cholesky_prior_vars_cholesky_3;", block = "tparameters")
+mono_dist_model_currstudy_sim_priors = mono_dist_model_currstudy_sim_priors + set_prior("
+  {
+  real cor_part_cholesky_prior_contrib[3];
+  vector[3] vectorised_L;
+  vectorised_L[1] = L_1[2,1];
+  vectorised_L[2] = L_1[3,1];
+  vectorised_L[3] = L_1[3,2];
+  for (k in 1:3){
+    cor_part_cholesky_prior_contrib[k] = log(cor_part_cholesky_prior_mixprobs[k])+multi_normal_cholesky_lpdf(vectorised_L | cor_part_cholesky_prior_means[,k], cor_part_cholesky_prior_vars_cholesky[k]);
+  }
+  target += log_sum_exp(cor_part_cholesky_prior_contrib);
+}",check=FALSE)
+mono_dist_model_currstudy_sim_priors$prior[4] = "" #Suppress the original intercept prior
+
+
+  make_stancode(distance | cens(censored) ~ (hamming_segdists_new + hamming_co | participant) +(1|variable) + hamming_segdists_new + hamming_co, data = dist_judgements_melted_mono_new, stanvars = mono_dist_model_currstudy_sim_stanvars, prior = mono_dist_model_currstudy_sim_priors)
+
+```
+
+After finishing the model setup, we fit the model to the old data to ensure the code works.
+
+```{r}
+
+  
+#Fit with old data and new priors to see what happens
+mono_dist_model_currstudy_sim_brms = brm(distance | cens(censored) ~ (hamming_segdists_new + hamming_co | participant) +(1|variable) + hamming_segdists_new + hamming_co, data = dist_judgements_melted_mono_new, chains = 1L, iter = 200, stanvars = mono_dist_model_currstudy_sim_stanvars, prior = mono_dist_model_currstudy_sim_priors)
+  
+  
+  mono_dist_model_currstudy_sim_brms = brm(distance | cens(censored) ~ (hamming_segdists_new + hamming_co | participant) +(1|variable) + hamming_segdists_new + hamming_co, data = dist_judgements_melted_mono_new, chains = 1L, stanvars = mono_dist_model_currstudy_sim_stanvars, prior = mono_dist_model_currstudy_sim_priors, control = list(adapt_delta = 0.995, max_treedepth = 15))
+```
+
+Now we simulate some fake data. The purpose is to determine, with different sample sizes, how confident we'll able to be about INDIVIDUAL GNM weights.
+
+```{r}
+
+#Fake-data simulation
+getCovMatrix = function(sds, correlations){
+  ladd = matrix(c(.5,0,0,correlations[1],.5,0,correlations[2],correlations[3],.5),nrow=3,byrow=T)
+  correlMatrix = ladd + t(ladd)
+  covMatrix = diag(sds) %*% correlMatrix %*% diag(sds)
+  return(covMatrix)
+}
+
+
+nsims = 100
+S = 48
+I = 36
+fakeDataMatrix = data.frame(matrix(0,nrow=S*I,ncol = 7))
+colnames(fakeDataMatrix) = c("participant","variable","distance","hamming_segdists_new","hamming_co","censored","trialno")
+fakeDataMatrix$participant = paste("P",rep(1:S,each=I),sep="")
+fakeDataMatrix$trialno = rep(1:I,S)
+
+means = numeric(nsims)
+meanSegWidth = numeric(nsims)
+meanToneWidth = numeric(nsims)
+meanInterceptWidth = numeric(nsims)
+
+for(i in 1:nsims){
+
+paramID = ceiling(runif(1)*4000)
+b = mono_draws_b_df[paramID,]
+sd_part = mono_draws_sd_part_df[paramID,]
+cor_part= mono_draws_cor_part_df[paramID,]
+covMatrix_part = getCovMatrix(sd_part, cor_part)
+sd_var = mono_draws_sd_var_df[paramID,]
+sigma = mono_draws_sigma_df[paramID]
+
+re_var = rnorm(72, sd = sd_var)
+re_part = mvrnorm(n = S, mu = rep(0,3), Sigma = covMatrix_part)
+epsilon = rnorm(S * I, sd = sigma)
+for(s in 1:S){
+  currRowNumbers = ((s-1)*I+1):(s*I)
+  items = order(runif(72))[1:I]
+  re_var_actual = re_var[items]
+  fakeDataMatrix[currRowNumbers,"variable"] = paste("M",items,"_1",sep="")
+  currSegDists = hamming_stringdists_monosyl_new[items,2]
+  currToneDists =  tone_dists_monosyl[items,"hamming_co"]
+  fakeDataMatrix[currRowNumbers,"hamming_segdists_new"] = currSegDists
+  fakeDataMatrix[currRowNumbers,"hamming_co"] = currToneDists
+  y = as.numeric(b[1]) + re_part[s,1] + as.numeric((re_part[s,2] + b[2])) * currSegDists  + as.numeric(re_part[s,3] + b[3]) * currToneDists  + re_var_actual + epsilon[currRowNumbers]
+  y_star = sapply(y, function(x) return(max(min(x,4),0)))
+  fakeDataMatrix["distance"] = y_star
+  fakeDataMatrix["censored"] = (y_star == 4)
+}
+
+mono_dist_model_currstudy_sim_brms = brm(distance | cens(censored) ~ (hamming_segdists_new + hamming_co | participant) +(1|variable) + hamming_segdists_new + hamming_co, data = fakeDataMatrix, chains = 4L, cores = getOption("mc.cores", 4L), stanvars = mono_dist_model_currstudy_sim_stanvars, prior = mono_dist_model_currstudy_sim_priors, control = list(adapt_delta = 0.995, max_treedepth = 15))
+
+meanSegWidth[i] = mean(coef(mono_dist_model_currstudy_sim_brms,probs=c(.05,.95))$participant[,4,"hamming_segdists_new"]-coef(mono_dist_model_currstudy_sim_brms,probs=c(.05,.95))$participant[,3,"hamming_segdists_new"])
+meanToneWidth[i] = mean(coef(mono_dist_model_currstudy_sim_brms,probs=c(.05,.95))$participant[,4,"hamming_co"]-coef(mono_dist_model_currstudy_sim_brms,probs=c(.05,.95))$participant[,3,"hamming_co"])
+meanInterceptWidth[i] = mean(coef(mono_dist_model_currstudy_sim_brms,probs=c(.05,.95))$participant[,4,"Intercept"]-coef(mono_dist_model_currstudy_sim_brms,probs=c(.05,.95))$participant[,3,"Intercept"])
+}
+```

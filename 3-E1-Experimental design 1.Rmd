@@ -1,0 +1,281 @@
+---
+title: "Generating all syllables"
+output: html_document
+---
+
+First import the libraries:
+
+```{r}
+library(readr)
+library(brms)
+library(dplyr)
+library(readr)
+library(MASS)
+library(GA)
+setwd("G:\\§Úªº¶³ºÝµwºÐ\\Phonotactics\\judgement-experiment\\phonotactics-judgement-experiment")
+#setwd("G:\\My Drive\\Phonotactics (1)\\judgement-experiment\\phonotactics-judgement-experiment")
+```
+
+First we need to create all possible syllables in the language. We do so by listing all the possible initials, nuclei and finals:
+
+```{r}
+#Generation of all possible syls
+
+initials = c("0","b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "N", "h", "G", "K", "w", "z", "c", "s", "j")
+nuclei = c("A", "a", "e", "i", "o", "u", "O", "Y")
+finals = c("0", "i", "u", "m", "n", "N", "p", "t", "k", "Y")
+tones = c("1", "2", "3", "4","5","6")
+allsyllables = vector(length=length(initials) * length(nuclei) * length(finals) * length(tones))
+j = 1
+syllableswt = character()
+for( i in initials){
+  for(n in nuclei){
+    for(f in finals){
+      for(t in tones){
+        syllableswt[j] = paste(i, n, f, t, sep="")
+        j = j + 1
+      }
+    }
+  }
+}
+```
+
+Then we can calculate the probability of a syllable with this function. Here, we have combined several measures from the Vitevich and Luce quantities:
+
+* The probability of the first segment being the initial
+* The transitional probability from segment 1 to segment 2, and from segment 2 to segment 3
+* the probability of the tone given the three segments
+
+The four probs are multiplied to get an overall measure of the probability.
+
+```{r}
+
+getSyllableProb = function(sylstring){
+  print(sylstring)
+  syl = strsplit(sylstring,"")[[1]]
+  initialProb = posProbs %>% filter(as.character(phoneme) == syl[1]) %>% ungroup() %>% dplyr::select(probOnset)
+  trans1 = transMatrixw0[syl[1],syl[2]] + 1e-10
+  trans2 = transMatrixw0[syl[2],syl[3]] + 1e-10
+  toneCondProb = getToneProbs(sylstring)[as.integer(syl[4])]
+  result = as.matrix(initialProb * trans1 * trans2 * toneCondProb)
+  names(result) = ""
+  as.vector(result)
+}
+
+probs = sapply(syllableswt,getSyllableProb)
+
+syllableswt_no0 = gsub("0","",syllableswt)
+syllableswt_no0_notone = gsub("[1-6]","",syllableswt_no0)
+syllableswt_tone = substring(syllableswt,4,4)
+```
+
+For testing purposes, we create a set of variable storing only a part of the total number of possible syllables.
+
+```{r}
+#For testing purposes only
+subset = ceiling(runif(100,0,1)*length(syllableswt))
+syllableswt_subset = syllableswt[subset]
+probs_subset = probs[subset]
+syllableswt_no0_subset = syllableswt_no0[subset]
+syllableswt_no0_notone_subset = syllableswt_no0_notone[subset]
+syllableswt_tone_subset = syllableswt_tone[subset]
+
+
+existing_syls = read_csv("all_parsed_syls_wt.csv")
+```
+
+
+Now we load the data from the monosyllable distance model. We also import the corpus.
+
+```{r}
+
+load("data_with_mono_model.RData")
+monosyls.data = read_csv("all_parsed_syls_wt.csv")
+monosyls.data = monosyls.data %>% mutate(c = case_when(n %in% c("E", "o","u") & c == "i" ~ "Y",
+                                                       T ~ c)) 
+monosyls.summary.wt = monosyls.summary.wt %>% mutate("syl" = paste(o,n,c,t,sep="")) %>% mutate("syl" = gsub("0","",syl)) %>% mutate("logfreq" = log(freq,10))
+
+```
+
+Calculate all the segmental distances:
+
+```{r}
+#Segmental distances
+canto.features = read.table("canto-features.txt",row.names=1)
+features.hamming.matrix = getDistancesFromFeatures(canto.features,normalise=TRUE)
+
+all_string_to_lex_seg_dists = stringdistMultCore(strings=syllableswt_no0_notone_subset, tostrings=monosyls.summary.wt$seg, segment.specific.costs = TRUE,costs=c(.5,.5,1,1), distance.matrix=features.hamming.matrix, cluster = cl)
+all_string_to_lex_seg_dists = stringdistMultCore(strings=syllableswt_no0_notone, tostrings=monosyls.summary.wt$seg,segment.specific.costs = TRUE,costs=c(.5,.5,1,1), distance.matrix=features.hamming.matrix, cluster = cl)
+
+```
+
+And all the tonal distances:
+
+```{r}
+#Tonal distances
+canto_tone_oco = read.csv("cantonese-onconoff.csv")
+hamming_dists_co_table = stringdist(paste(canto_tone_oco[,3],canto_tone_oco[,4],sep=""),mode="levenshtein")
+hamming_dists_co_table = hamming_dists_co_table / max(hamming_dists_co_table)
+
+all_string_to_lex_tone_dists = hamming_dists_co_table[as.integer(syllableswt_tone),as.integer(monosyls.summary.wt$t)]
+```
+
+Import the (old) distance model:
+
+```{r}
+dist_model = model_mono_hamming_co_hamming_seg_new
+#For now just use the fixed effects; we'll change this later
+dist_model_Intercept = summary(model_mono_hamming_co_hamming_seg_new)$fixed[1,1]
+dist_model_segdist = summary(model_mono_hamming_co_hamming_seg_new)$fixed[2,1]
+dist_model_tonedist = summary(model_mono_hamming_co_hamming_seg_new)$fixed[3,1]
+```
+
+The three 'multiplicands' (details in the paper) which we will be using to turn the GNM fitting problem into a linear regression problem which is much easier to handle:
+
+```{r}
+exp_neg_string_to_lex_dists = exp(-(dist_model_Intercept + dist_model_segdist * all_string_to_lex_seg_dists + dist_model_tonedist * all_string_to_lex_tone_dists))
+A_multiplicands = sapply(1:length(syllableswt_no0), function(i) return(sum((monosyls.summary.wt$logfreq)^2 * exp_neg_string_to_lex_dists[i,])))
+B_multiplicands = sapply(1:length(syllableswt_no0), function(i) return(sum(monosyls.summary.wt$logfreq * exp_neg_string_to_lex_dists[i,])))
+C_multiplicands = sapply(1:length(syllableswt_no0), function(i) return(sum(exp_neg_string_to_lex_dists[i,])))
+```
+
+A list of potential items:
+
+```{r}
+potentialItems = data.frame(string = syllableswt, t = syllableswt_tone, prob = probs, A_multiplicands, B_multiplicands, C_multiplicands)
+potentialItems = potentialItems %>% mutate(o = substring(string,1,1), n = substring(string,2,2), c = substring(string,3,3), logprob = log(prob), id = 1:nrow(potentialItems))
+
+monosyls.summary.wt = monosyls.summary.wt %>% mutate(string = paste0(o,n,c,t))
+potentialItems = potentialItems %>% filter(!(string %in% monosyls.summary.wt$string)) %>% filter((n != c))  %>%
+  mutate(id = 1:nrow(potentialItemsMinusExistent)) %>%
+  filter(!(string %in% c("gO04","cAN4","Noi4","me02","toY5","lON1","KaN2","so04","jai1","hon1","cAp2","pui3","tO05","jip2","hai6","mok2","gON1","cAm3","coi2","pei1","loY6","ham2","coi1"))) %>% filter(!(substring(string,1,1) == "n" & paste0("l",substring(string,2,4)) %in% monosyls.summary.wt$string))
+
+allOs = length(unique(potentialItems[,"o"]))
+allNs = length(unique(potentialItems[,"n"]))
+allCs = length(unique(potentialItems[,"c"]))
+allTs = length(unique(potentialItems[,"t"]))
+```
+Some functions for generating a good initial solution. The goal is to include every single phoneme; we'll let the algorithm handle the part about no correlation.
+
+```{r}
+pickRandomlyFromVector = function(x){
+  rannos = runif(1:length(x))
+  x[which(rannos == min(rannos))]
+}
+
+addToBasket = function(item, basket, limit){
+  if(length(basket) < limit){
+    basket = c(basket,item)
+  } else{
+    print("basket exceeded")
+  }
+  return(basket)
+}
+
+#Find initial solutions
+getInitialSolution = function(potentialItems){
+  max = nrow(potentialItems)
+  neededOnsets = unique(potentialItems[,"o"])
+  neededNuclei = unique(potentialItems[,"n"])
+  neededCodas = unique(potentialItems[,"c"])
+  neededTones = unique(potentialItems[,"t"])
+  availableItems = potentialItems
+  pickedItems = numeric()
+  noitems = 72
+  
+  for(currOnset in neededOnsets){
+    possibleItems = potentialItems %>% filter(o == currOnset)
+    possibleItemIDs = as.matrix(possibleItems %>% dplyr::select(id))
+    pickedItem = pickRandomlyFromVector(possibleItemIDs)
+    availableItems = availableItems %>% filter(id != pickedItem)
+    neededNuclei = neededNuclei[neededNuclei != as.vector(as.matrix(possibleItems %>% filter(id == pickedItem) %>% dplyr::select(n)))]
+    neededCodas = neededCodas[neededCodas != as.vector(as.matrix(possibleItems %>% filter(id == pickedItem) %>% dplyr::select(n)))]
+    neededTones = neededTones[neededTones != as.vector(as.matrix(possibleItems %>% filter(id == pickedItem) %>% dplyr::select(n)))]
+    pickedItems = addToBasket(pickedItem, pickedItems, noitems)
+  }
+  
+  for(currNucleus in neededNuclei){
+    possibleItems = availableItems %>% filter(n == currNucleus)
+    possibleItemIDs = as.matrix(possibleItems %>% dplyr::select(id))
+    pickedItem = pickRandomlyFromVector(possibleItemIDs)
+    availableItems = availableItems %>% filter(id != pickedItem)
+    neededCodas = neededCodas[neededCodas != as.vector(as.matrix(possibleItems %>% filter(id == pickedItem) %>% dplyr::select(n)))]
+    neededTones = neededTones[neededTones != as.vector(as.matrix(possibleItems %>% filter(id == pickedItem) %>% dplyr::select(n)))]
+    pickedItems = addToBasket(pickedItem, pickedItems, noitems)
+  }
+  
+  for(currCoda in neededCodas){
+    possibleItems = availableItems %>% filter(c == currCoda)
+    possibleItemIDs = as.matrix(possibleItems %>% dplyr::select(id))
+    pickedItem = pickRandomlyFromVector(possibleItemIDs)
+    availableItems = availableItems %>% filter(id != pickedItem)
+    neededTones = neededTones[neededTones != as.vector(as.matrix(possibleItems %>% filter(id == pickedItem) %>% dplyr::select(n)))]
+    pickedItems = addToBasket(pickedItem, pickedItems, noitems)
+  }
+  
+  for(currTone in neededTones){
+    possibleItems = availableItems %>% filter(t == currTone)
+    possibleItemIDs = as.matrix(possibleItems %>% dplyr::select(id))
+    pickedItem = pickRandomlyFromVector(possibleItemIDs)
+    availableItems = availableItems %>% filter(id != pickedItem)
+    pickedItems = addToBasket(pickedItem, pickedItems, noitems)
+  }
+  
+  remainingItemNo = (noitems - length(pickedItems))
+  pickedItems = c(pickedItems, availableItems[order(runif(1:nrow(availableItems)))[1:remainingItemNo],"id"])
+  
+  print("Generated initial solution:")
+  print(pickedItems)
+  pickedItems
+}
+
+initialSolutions = t(sapply(1:100,function(x) getInitialSolution(potentialItemsMinusExistent)))
+
+```
+
+A function for assigning the fitness score.
+* If not all phonemes are used, the design is basically rejected.
+* If a syllable is repeated, the design is again basically rejected.
+* Otherwise, the fitness depends on multiple correlation of the prob on the GNM covariates 
+
+```{r}
+getFitnessScoreReal = function(realScheme, potentialItems){
+  scheme = round(realScheme)
+  if(runif(1,0,1) < .05) print(scheme)
+  if(length(unique(potentialItems[scheme,"o"])) !=  (allOs) |
+            length(unique(potentialItems[scheme,"n"])) !=  (allNs) |
+            length(unique(potentialItems[scheme,"c"])) !=  (allCs) |
+            length(unique(potentialItems[scheme,"t"])) !=  (allTs) ){
+    fitness = -99999999 #* (abs(length(unique(potentialItems[scheme,"o"])) -  length(allOs)) +                          abs(length(unique(potentialItems[scheme,"n"])) -  length(allNs)) +                          abs(length(unique(potentialItems[scheme,"c"])) -  length(allCs)) +                          abs(length(unique(potentialItems[scheme,"t"])) -  length(allTs)))
+  } else if(length(unique(scheme)) != length(scheme)){
+    fitness = -99999999 #* abs(length(unique(scheme)) - length(scheme))
+  } else {
+    corrs = (cor(potentialItems[scheme,c("A_multiplicands","B_multiplicands","C_multiplicands","logprob")]))
+    fitness = -abs(corrs[4,1:3] %*% solve(corrs[1:3,1:3]) %*% corrs[1:3,4])
+  }
+  fitness
+}
+```
+
+Running the actual GA:
+
+```{r}
+GA1 = ga(type = "real", fitness = getFitnessScoreReal, potentialItemsMinusExistent, lower = rep(1,72), upper = rep(nrow(potentialItemsMinusExistent),72), suggestions = initialSolutions, popSize = 100, maxiter = 10000, run = 200, pcrossover = 0, pmutation = .5)
+
+bestDesign = round(summary(GA1)$solution)
+
+bestDesignItems = potentialItemsMinusExistent[potentialItemsMinusExistent$id %in% bestDesign,]
+bestDesignItems
+
+sd(potentialItems$logprob)
+sd(potentialItems[potentialItems$id %in% bestDesign,"logprob"])
+sd(potentialItems[potentialItems$id %in% bestDesign,"A_multiplicands"])
+sd(potentialItems[potentialItems$id %in% bestDesign,"B_multiplicands"])
+sd(potentialItems[potentialItems$id %in% bestDesign,"C_multiplicands"])
+sd(potentialItems$A_multiplicands)
+sd(potentialItems$B_multiplicands)
+sd(potentialItems$C_multiplicands)
+
+write.csv(bestDesignItems, "design.csv")
+save.image("UpToExpDesign1.Rdata")
+```
