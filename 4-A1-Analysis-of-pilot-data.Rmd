@@ -1,0 +1,227 @@
+---
+title: "Analysis of pilot data"
+output: html_document
+---
+
+```{r echo=F}
+Sys.setlocale('LC_ALL','C')
+```
+
+
+##Preparatory tasks
+
+Import libraries:
+
+```{r}
+library(dplyr)
+library(brms)
+library(reshape2)
+library(mgcv)
+library(gamm4)
+library(mclust)
+library(ggplot2)
+library(readr)
+library(MASS)
+
+setwd("G:\\§Úªº¶³ºÝµwºÐ\\Phonotactics\\judgement-experiment\\phonotactics-judgement-experiment")
+
+load("UpToExpDesign1.Rdata")
+```
+
+Importing and cleaning pilot study data:
+
+```{r}
+pilotdata.raw = read.csv("pilot-data.csv")
+pilotdata.raw = pilotdata.raw[-c(1,2),]
+pilotdata = pilotdata.raw %>% filter(as.character(DistributionChannel) != "preview")
+pilotdata = pilotdata %>% mutate(participant = paste0("P",1:nrow(pilotdata)))
+colnames(pilotdata)[which(colnames(pilotdata) == "MP.4_1")] = "MP14_1"
+pilot.dist.data.melted = melt(pilotdata, na.rm = T, id.vars = "participant",measure.vars = paste0("M",1:72,"_1"))
+pilot.dist.data.melted = pilot.dist.data.melted %>% mutate(value = as.numeric(value)) %>% filter(!is.na(value))
+pilot.dist.data.melted = pilot.dist.data.melted %>% right_join(hamming_stringdists_monosyl_new, by = "variable")%>% right_join(tone_dists_monosyl, by = "variable")
+colnames(pilot.dist.data.melted)[which(colnames(pilot.dist.data.melted) == "hamming_stringdists_monosyl_new")] = "hamming_segdists_new"
+pilot.dist.data.melted = pilot.dist.data.melted %>% mutate(distance = (100 - value) / 100 * 4) %>% mutate(censored = (distance == 4))
+```
+
+Running the monosyllable model:
+
+```{r}
+make_stancode(distance | cens(censored) ~ (hamming_segdists_new + hamming_co | participant) +(1|variable) + hamming_segdists_new + hamming_co, data = pilot.dist.data.melted, stanvars = mono_dist_model_currstudy_sim_stanvars, prior = mono_dist_model_currstudy_sim_priors)
+
+mono_dist_model_currstudy_sim_brms = brm(distance | cens(censored) ~ (hamming_segdists_new + hamming_co | participant) +(1|variable) + hamming_segdists_new + hamming_co, data = pilot.dist.data.melted, chains = 4L, stanvars = mono_dist_model_currstudy_sim_stanvars, prior = mono_dist_model_currstudy_sim_priors, cores = getOption("mc.cores", 4L))
+
+
+individual_ests = ranef(mono_dist_model_currstudy_sim_brms)$participant
+poplvl_ests = fixef(mono_dist_model_currstudy_sim_brms)
+totaleffs = cbind(individual_ests[,,1][,1] + poplvl_ests[1,1], individual_ests[,,2][,1] + poplvl_ests[2,1], individual_ests[,,3][,1] + poplvl_ests[3,1])
+totaleffs = cbind.data.frame(participant = rownames(totaleffs), totaleffs)
+colnames(totaleffs) = c("participant","intercept_beta", "segdist_beta", "tonedist_beta")
+upci = cbind(individual_ests[,,1][,3] + poplvl_ests[1,1], individual_ests[,,2][,3] + poplvl_ests[2,1], individual_ests[,,3][,3] + poplvl_ests[3,1])
+lowci = cbind(individual_ests[,,1][,4] + poplvl_ests[1,1], individual_ests[,,2][,4] + poplvl_ests[2,1], individual_ests[,,3][,4] + poplvl_ests[3,1])
+write.csv(totaleffs, "individual_weights")
+```
+
+
+Preparing the design data frame (this is making me wonder, is this where the term 'design matrix' comes from??):
+
+```{r}
+#Prerequisites: generate_all_syls, pilot-dist-analysis have been run
+design = read.csv("apr-design.csv",stringsAsFactors=F)
+design = design %>% dplyr::select(o, n, c, t, string) %>% mutate(t = as.character(t))
+design = design %>% mutate(n = case_when(string == "lak1" ~ "A", TRUE ~ n), o = case_when(string == "coi3" ~ "s", TRUE ~ o),
+                           string = case_when(string == "lak1" ~ "lAk1", string == "coi3" ~ "soi3", TRUE ~ string))
+design = design %>% mutate(item = paste0("MP",1:nrow(design),"_1")) %>% dplyr::select(item, everything())
+design = design %>% mutate(stringno0 = gsub("0","",string), seg =  gsub("[1-6]","",string), segno0 = gsub("0","",seg))
+design = design %>% mutate(prob = sapply(design$string,getSyllableProb)) %>% mutate(logprob = log(prob))
+```
+
+Add the augmented feature matrix:
+
+```{r}
+
+features.hamming.matrix.with0 = features.hamming.matrix %>% cbind(rep(mean(features.hamming.matrix),nrow(features.hamming.matrix))) %>% rbind(rep(mean(features.hamming.matrix),ncol(features.hamming.matrix)+1))
+rownames(features.hamming.matrix.with0)[nrow(features.hamming.matrix.with0)] = "0"
+colnames(features.hamming.matrix.with0)[ncol(features.hamming.matrix.with0)] = "0"
+```
+
+Some preparation for later separate analysis of onset/nucleus/coda:
+
+```{r}
+#Preparation for later ons/nuc/coda separate analysis
+pilot_string_to_lex_seg_dists_onset = features.hamming.matrix.with0[design$o,all_syls_types$o]
+pilot_string_to_lex_seg_dists_nucleus = features.hamming.matrix.with0[design$n,all_syls_types$n]
+pilot_string_to_lex_seg_dists_coda = features.hamming.matrix.with0[design$c,all_syls_types$c]
+pilot_string_to_lex_tone_dists = hamming_dists_co_table[as.integer(design$t),as.integer(all_syls_types$t)]
+pilot_string_to_lex_seg_dists = all_string_to_lex_seg_dists[design$segno0,]
+```
+
+GNM stuff, just as we've done last time:
+
+```{r}
+
+get_exp_neg_string_to_lex_dists = function(intercept, segweight, toneweight){
+  exp(-(pmax(pmin(intercept + segweight * pilot_string_to_lex_seg_dists + toneweight * pilot_string_to_lex_tone_dists,4),0)))
+}
+pilot_exp_neg_string_to_lex_dists_individual = lapply(totaleffs$participant,function(participant) get_exp_neg_string_to_lex_dists(totaleffs[participant,2],totaleffs[participant,3],totaleffs[participant,4]))
+names(pilot_exp_neg_string_to_lex_dists_individual) = rownames(totaleffs)
+get_gnm_multiplicands = function(part, exp_neg_string_to_lex_dists_list){
+  exp_neg_string_to_lex_dists = exp_neg_string_to_lex_dists_list[[as.character(part)]]
+  A_multiplicands = sapply(1:nrow(design), function(i) return(sum((all_syls_types$logfreq)^2 * exp_neg_string_to_lex_dists[i,])))
+  B_multiplicands = sapply(1:nrow(design), function(i) return(sum(all_syls_types$logfreq * exp_neg_string_to_lex_dists[i,])))
+  C_multiplicands = sapply(1:nrow(design), function(i) return(sum(exp_neg_string_to_lex_dists[i,])))
+  cbind.data.frame(participant = as.character(part),item = design$item,A_multiplicand = A_multiplicands,B_multiplicand = B_multiplicands,C_multiplicand = C_multiplicands)
+}
+pilot_gnm_multiplicands = lapply(totaleffs$participant, function(part) get_gnm_multiplicands(part, pilot_exp_neg_string_to_lex_dists_individual))
+names(pilot_gnm_multiplicands) = rownames(totaleffs)
+pilot_gnm_multiplicands = Reduce(rbind, pilot_gnm_multiplicands)
+```
+
+##Initial analyses
+Some wrangling:
+
+```{r}
+pilot.tactics.data.melted = melt(pilotdata, na.rm = T, id.vars = "participant",measure.vars = paste0("MP",1:73,"_1"), variable.name = "item")
+pilot.tactics.data.melted = pilot.tactics.data.melted %>% mutate(value = as.numeric(value), participant = as.character(participant), item = as.character(item)) %>% filter(!is.na(value))
+pilot.tactics.data.melted = pilot.tactics.data.melted %>% left_join(design, by = c("item"),na_matches = "never")
+pilot.tactics.data.melted = pilot.tactics.data.melted %>% dplyr::left_join(pilot_gnm_multiplicands, by = c("item", "participant"),na_matches = "never")
+pilot.tactics.data.melted = pilot.tactics.data.melted %>% mutate(value = value / 100)
+```
+
+A plot of logprob against judgements:
+```{r}
+pilot_logprob_against_judgement = ggplot(pilot.tactics.data.melted, aes(y = value, x = logprob, color = participant)) + geom_point()
+pilot_logprob_against_judgement
+```
+
+And against the GNM values:
+
+```{r}
+pilot_logprob_against_A = ggplot(pilot.tactics.data.melted, aes(y = value, x = A_multiplicand, color = participant)) + geom_point()
+pilot_logprob_against_A
+pilot_logprob_against_B = ggplot(pilot.tactics.data.melted, aes(y = value, x = B_multiplicand, color = participant)) + geom_point()
+pilot_logprob_against_B
+pilot_logprob_against_C = ggplot(pilot.tactics.data.melted, aes(y = value, x = C_multiplicand, color = participant)) + geom_point()
+pilot_logprob_against_C
+```
+
+Building the BRMS model:
+
+```{r, eval = F}
+pilot.tactics.model = brm(value  ~ (A_multiplicand + B_multiplicand + C_multiplicand + logprob | participant) +(1|item) + A_multiplicand + B_multiplicand + C_multiplicand + logprob, data = pilot.tactics.data.melted, chains = 4L, iter = 2000, control = list(adapt_delta = 0.9, max_treedepth = 25), cores = getOption("mc.cores", 4L))
+```
+
+```{r, eval = F}
+pilot_tactics_ppcheckscatter = pp_check(pilot.tactics.model, "scatter_avg")
+ggsave("pilot_tactics_ppcheckscatter.png",pilot_tactics_ppcheckscatter)
+```
+
+
+The results don't look impressive, so I decided to look for better predictors before proceeding to collect the new batch of data.
+
+```{r}
+pilot.tactics.model_lponly = brm(value  ~ (logprob | participant) +(1|item) + logprob, data = pilot.tactics.data.melted, chains = 4L, iter = 2000, control = list(adapt_delta = 0.999, max_treedepth = 25), cores = getOption("mc.cores", 4L), prior = prior(normal(0, 1), class = b))
+```
+
+```{r}
+pilot_logprob_against_judgement = ggplot(pilot.tactics.data.melted, aes(y = value, x = logprob, color = participant)) + geom_point() + geom_abline(slope = 0.02, intercept = 0.73)
+pilot_logprob_against_judgement
+```
+
+```{r}
+pilot.tactics.model_trunc_lponly = brm(value | trunc(lb = 0, ub = 1)  ~ (logprob | participant) +(1|item) + logprob, data = pilot.tactics.data.melted, chains = 4L, iter = 2000, control = list(adapt_delta = 0.999, max_treedepth = 25), cores = getOption("mc.cores", 4L), prior = prior(normal(0, 1), class = b))
+```
+
+```{r}
+save.image("pilot-anal1.Rdata")
+```
+
+##Changing the models
+
+Get (multiple) syllable probabilities:
+
+```{r, eval = F}
+getSyllableProbs = function(sylstring){
+  syl = strsplit(sylstring,"")[[1]]
+  onsetProb = as.matrix(posProbs %>% filter(as.character(phoneme) == syl[1]) %>% ungroup() %>% dplyr::select(probOnset))
+  nucProb = as.matrix(posProbs %>% filter(as.character(phoneme) == syl[2]) %>% ungroup() %>% dplyr::select(probNuc))
+  codaProb = as.matrix(posProbs %>% filter(as.character(phoneme) == syl[3]) %>% ungroup() %>% dplyr::select(probCoda))
+  trans1 = transMatrixw0[syl[1],syl[2]]
+  trans2 = transMatrixw0[syl[2],syl[3]]
+  toneOverallProb = getToneProbs(sylstring)[as.integer(syl[4])]
+  toneCondProb = getToneProbs(sylstring)[as.integer(syl[4])]
+  resultsVector =  as.vector(c(onsetProb,nucProb,codaProb,trans1,trans2,toneOverallProb,toneCondProb))
+  names(resultsVector) = c("onsetProb","nucProb","codaProb","trans1","trans2","toneOverallProb","toneCondProb")
+  resultsVector
+}
+```
+
+Trying to fit the model with more predictors:
+
+```{r, include = F}
+design = design %>% cbind(t(sapply(design$string,getSyllableProbs)))
+
+pilot.tactics.data.melted = melt(pilotdata, na.rm = T, id.vars = "participant",measure.vars = paste0("MP",1:73,"_1"), variable.name = "item")
+pilot.tactics.data.melted = pilot.tactics.data.melted %>% mutate(value = as.numeric(value), participant = as.character(participant), item = as.character(item)) %>% filter(!is.na(value))
+pilot.tactics.data.melted = pilot.tactics.data.melted %>% left_join(design, by = c("item"),na_matches = "never")
+pilot.tactics.data.melted = pilot.tactics.data.melted %>% dplyr::left_join(pilot_gnm_multiplicands, by = c("item", "participant"),na_matches = "never")
+pilot.tactics.data.melted = pilot.tactics.data.melted %>% mutate(value = value / 100)
+
+pilot.tactics.model_var1 = brm(value  ~ (A_multiplicand + B_multiplicand + C_multiplicand + logprob| participant) +(1|item) + A_multiplicand + B_multiplicand + C_multiplicand + onsetProb + nucProb + codaProb + trans1 + trans2 + toneOverallProb + toneCondProb, data = pilot.tactics.data.melted, chains = 4L, iter = 2000, control = list(adapt_delta = 0.95, max_treedepth = 25), cores = getOption("mc.cores", 4L), prior = prior(normal(0, 1), class = b))
+pilot.tactics.model_var2 = brm(value  ~ (A_multiplicand + B_multiplicand + C_multiplicand + logprob| participant) +(1|item) + A_multiplicand + B_multiplicand + C_multiplicand + onsetProb + nucProb + codaProb + trans1 + trans2 + toneOverallProb + toneCondProb, data = pilot.tactics.data.melted, chains = 4L, iter = 2000, control = list(adapt_delta = 0.9, max_treedepth = 25), cores = getOption("mc.cores", 4L), prior = prior(normal(0, 2), class = b))
+
+pilot.tactics.data.melted = pilot.tactics.data.melted %>% mutate(totalPosProb = onsetProb + nucProb + codaProb, totalTransProb = trans1 + trans2)
+
+pilot.tactics.model_totalPosTransProb_var1 = brm(value  ~ (A_multiplicand + B_multiplicand + C_multiplicand + logprob| participant) +(1|item) + A_multiplicand + B_multiplicand + C_multiplicand + totalPosProb + totalTransProb + toneOverallProb + toneCondProb, data = pilot.tactics.data.melted, chains = 4L, iter = 2000, control = list(adapt_delta = 0.99, max_treedepth = 25), cores = getOption("mc.cores", 4L), prior = prior(normal(0, 1), class = b))
+```
+
+Trying GAMMs:
+
+```{r, eval = F}
+library(mgcv)
+library(gamm4)
+pilot.tactics.gamm_var1_fixonly = gamm4(value  ~ A_multiplicand + B_multiplicand + C_multiplicand + totalPosProb + totalTransProb + toneOverallProb + toneCondProb, data = pilot.tactics.data.melted, random = ~(1|item))
+pilot.tactics.gamm_var1_gnmrand = gamm4(value  ~ s(A_multiplicand) + s(B_multiplicand) + s(C_multiplicand) + totalPosProb + totalTransProb + toneOverallProb + toneCondProb, data = pilot.tactics.data.melted, random = ~(1|item))
+pilot.tactics.gamm_var1_probrand = gamm4(value  ~ s(A_multiplicand) + s(B_multiplicand) + s(C_multiplicand) + s(totalPosProb) + s(totalTransProb) + s(toneOverallProb) + s(toneCondProb), data = pilot.tactics.data.melted, random = ~(1|item))
+pilot.tactics.gamm_var1_subjeff = gamm4(value  ~ s(A_multiplicand, k=20) + s(B_multiplicand, k=20) + s(C_multiplicand, k=20) + s(totalPosProb, k=20) + s(totalTransProb, k=20) + s(toneOverallProb, k=20) + s(toneCondProb, k=20), data = pilot.tactics.data.melted, random = ~ (1 | item) + (1 | participant))
+pilot.tactics.gamm_var1_allsubjeff = gamm4(value  ~  s(A_multiplicand) + s(B_multiplicand) + s(C_multiplicand) + s(totalPosProb) + s(totalTransProb) + s(toneOverallProb) + s(toneCondProb) , data = pilot.tactics.data.melted, random = ~ (1 | item) + (1 +  A_multiplicand + B_multiplicand + C_multiplicand + totalPosProb + totalTransProb + toneOverallProb + toneCondProb| participant),control = lmerControl(optCtrl=list(maxfun=1e8)))
+```

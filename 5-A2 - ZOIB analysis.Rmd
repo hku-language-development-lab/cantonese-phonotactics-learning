@@ -1,0 +1,28 @@
+---
+title: "Analysis of pilot data"
+output: html_document
+---
+
+```{r echo=F}
+Sys.setlocale('LC_ALL','C')
+```
+
+##Preparatory tasks
+
+Import libraries:
+
+```{r}
+library(dplyr)
+library(bayesplot)
+library(rjags)
+library(zoib)
+setwd("G:\\§Úªº¶³ºÝµwºÐ\\Phonotactics\\judgement-experiment\\phonotactics-judgement-experiment")
+
+load("pilot-anal1.Rdata")
+```
+
+
+
+```{r}
+
+```
